@@ -1,0 +1,77 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  background: #f5f6f8;
+  color: #263238;
+  -webkit-font-smoothing: antialiased;
+  font-size: 14px;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* 配色变量（清爽、低饱和） */
+:root {
+  --app-bg: #f5f6f8;
+  --surface: #ffffff;
+  --border: #e6e8eb;
+  --text-primary: #263238;
+  --text-secondary: #6b7684;
+  --text-muted: #909aa6;
+  --primary: #3b82f6;
+  --primary-soft: #eff6ff;
+  --primary-active: #1e64d6;
+  --success: #22a06b;
+  --warning: #d58923;
+  --danger: #e04f4f;
+
+  /* Element Plus 主题微调 */
+  --el-color-primary: #3b82f6;
+  --el-color-primary-light-3: #7aa4f8;
+  --el-color-primary-light-5: #a3bff9;
+  --el-color-primary-light-7: #ccdbfc;
+  --el-color-primary-light-8: #dde8fd;
+  --el-color-primary-light-9: #eff6ff;
+  --el-color-primary-dark-2: #1e64d6;
+  --el-border-radius-base: 8px;
+  --el-font-size-base: 14px;
+  --el-box-shadow-lighter: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --el-text-color-primary: #263238;
+  --el-text-color-regular: #3f4b57;
+  --el-border-color: #e6e8eb;
+  --el-border-color-light: #eef0f2;
+  --el-fill-color-blank: #ffffff;
+  --el-bg-color: #ffffff;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d4d8dc;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #b9bec4;
+}
+
