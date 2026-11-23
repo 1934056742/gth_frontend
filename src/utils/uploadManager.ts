@@ -2,20 +2,56 @@ import { reactive } from 'vue'
 import axios from 'axios'
 import { checkFile, uploadChunk, getFiles } from '@/api/upload'
 import { calculateFileHash, buildFileKey } from '@/utils/hash'
+import {
+  uploadFileToOss,
+  fetchOssCredential,
+  isOssDisabledError,
+  toSdkCheckpoint,
+  OssUploadCanceled,
+  type StoredCheckpoint
+} from '@/utils/ossUpload'
 import { DEFAULT_CHUNK_SIZE } from '@/types'
-import type { UploadTask, UploadRecord, UploadFileItem, UploadOwnership, UploadFileQuery } from '@/types'
+import type {
+  UploadTask,
+  UploadRecord,
+  UploadFileItem,
+  UploadOwnership,
+  UploadFileQuery,
+  OssCredential
+} from '@/types'
 
 /**
- * 文件上传核心引擎（秒传 + 断点续传）
+ * 文件上传核心引擎（OSS 直传 / 分片上传双通道 + 秒传 + 断点续传）
  *
  * 流程：
  * 1. Worker 计算文件 SHA-256 -> fileHash
- * 2. POST /upload/check 校验：exists=true 直接秒传完成；否则拿到服务端已有分片
- * 3. 并发上传剩余分片，每成功一片就把进度写入 localStorage，刷新后仍能续传
- * 4. 全部完成后服务端自动合并（最后一片返回 url）
+ * 2. POST /upload/check 校验：exists=true 直接秒传完成（命中判定会自动区分 OSS / 本地）
+ * 3. 拿 OSS 凭证直传（字节不经过服务器）；OSS 未配置时自动回退到分片上传
+ * 4. 每成功一片就把进度写入 localStorage，刷新后仍能续传
  *
- * 状态通过 reactive 管理，页面直接绑定；刷新后调用 restoreTasks() 可恢复断点。
+ * 为什么优先 OSS：原方案所有分片都要先上传到我们的服务器再合并，
+ * 云主机上行带宽（常 1~10Mbps）会成为硬瓶颈；直传后只受用户自身带宽限制。
  */
+
+/** 上传通道：oss = 浏览器直传对象存储；local = 原来的分片上传到后端 */
+export type UploadChannel = 'oss' | 'local'
+
+/**
+ * 通道策略：
+ *   auto（默认）→ 优先 OSS，凭证获取失败（未配置 / 签发异常）时回退本地；
+ *   oss        → 只用 OSS，失败即报错（便于验证直传是否真的生效）；
+ *   local      → 只用本地分片（老行为，排查问题 / 临时降级用）。
+ */
+let channelPolicy: 'auto' | 'oss' | 'local' = 'auto'
+
+export function setUploadChannel(policy: 'auto' | 'oss' | 'local') {
+  channelPolicy = policy
+}
+
+export function getUploadChannel(): 'auto' | 'oss' | 'local' {
+  return channelPolicy
+}
+
 
 // 并发上传的分片数量（可在页面调整；默认 3 兼顾速度与浏览器连接数限制）
 // 说明：HTTP/1.1 下同一域名浏览器最多 6 个并发连接，留出余量给其他请求
@@ -145,10 +181,21 @@ function writeRecords(records: Record<string, UploadRecord>) {
   }
 }
 
-function saveRecord(task: UploadTask, fileHash: string) {
+function saveRecord(
+  task: UploadTask,
+  fileHash: string,
+  ossCheckpoint?: UploadRecord['ossCheckpoint']
+) {
   const records = readRecords()
   // 每张卡片只挂一个任务：多任务上传时同一文件会留下多条记录，各自记录自己的任务
   const taskId = task.taskId
+  const previous = records[task.fileKey]
+  // checkpoint 的保留规则：
+  //   - 本次传了新的 → 用新的；
+  //   - 本次没传，但上次是 OSS 通道留下的 → 保留（分片进度更新时不能把它冲掉）；
+  //   - 本次明确走本地通道 → 清空（避免下次误用失效的 uploadId）。
+  const checkpoint =
+    ossCheckpoint ?? (task.channel === 'local' ? undefined : previous?.ossCheckpoint)
   records[task.fileKey] = {
     fileKey: task.fileKey,
     fileHash,
@@ -160,6 +207,7 @@ function saveRecord(task: UploadTask, fileHash: string) {
     categoryId: task.categoryId,
     taskIds: taskId ? [taskId] : (task.taskIds ?? []),
     taskId,
+    ...(checkpoint ? { ossCheckpoint: checkpoint } : {}),
     updatedAt: Date.now()
   }
   writeRecords(records)
@@ -376,6 +424,117 @@ export function addFiles(files: File[], chunkSize = DEFAULT_CHUNK_SIZE, ownershi
   })
   return added
 }
+/**
+ * 尝试用 OSS 直传完成本次上传。
+ *
+ * @returns true  = 已经传完并登记了元数据（调用方跳过后续步骤）
+ *          false = 本次不走直传（未配置 / 策略为 local），调用方回退到分片上传
+ *
+ * 注意：这里只把「通道不可用」当作回退信号；一旦真正开始传字节之后失败，
+ *      就抛错让整个任务进入 error 状态，由用户点重试 —— 因为半途换通道
+ *      会导致「OSS 上有一半、服务器上有一半」，反而更难收拾。
+ */
+async function tryUploadViaOss(
+  task: UploadTask,
+  fileHash: string,
+  records: Record<string, UploadRecord>
+): Promise<boolean> {
+  const runtime = getRuntime(task.uid)
+  if (channelPolicy === 'local') {
+    task.channel = 'local'
+    return false
+  }
+
+  // 续传：只有当上次就是走 OSS 且留下了 checkpoint 时才带断点，
+  // 否则从头开始（避免把别处的进度误判成 OSS 的分片进度）
+  const savedCheckpoint = records[task.fileKey]?.ossCheckpoint
+  // SDK 的 checkpoint 里带 file 对象，续传时必须把当前选择/持有的文件重新挂上
+  const sdkCheckpoint = toSdkCheckpoint(savedCheckpoint, task.file)
+
+  let credential: OssCredential
+  try {
+    credential = await fetchOssCredential({
+      fileHash,
+      fileName: task.fileName,
+      fileSize: task.fileSize,
+      totalChunks: task.totalChunks,
+      categoryId: task.categoryId,
+      taskId: task.taskId
+    })
+  } catch (error) {
+    // 主动暂停：静默退出（外层会因 running=false 直接返回）
+    if (isAbortError(error) || !runtime.running) throw error
+    // 只有「服务端明确说没配 OSS」才回退；其它错误（401 / 500）应该暴露出来，
+    // 否则会被误判成「直传不可用」，白白退回慢通道而不自知。
+    if (channelPolicy === 'auto' && isOssDisabledError(error)) {
+      task.channel = 'local'
+      return false
+    }
+    throw error
+  }
+
+  task.channel = 'oss'
+  // 直传不需要分片表：进度完全由 OSS SDK 上报，清空分片维度状态避免算错
+  runtime.doneChunks = new Set<number>()
+  task.uploadedChunks = []
+  task.instant = false
+
+  let lastSavedCheckpoint = savedCheckpoint
+  await uploadFileToOss({
+    params: {
+      fileHash,
+      fileName: task.fileName,
+      fileSize: task.fileSize,
+      totalChunks: task.totalChunks,
+      categoryId: task.categoryId,
+      taskId: task.taskId
+    },
+    file: task.file,
+    credential,
+    // 和本地分片共用页面上同一个「N 并发」设置，改了立刻对直传生效
+    parallel: maxConcurrency,
+    ...(sdkCheckpoint ? { checkpoint: sdkCheckpoint } : {}),
+    ...(runtime.controller ? { signal: runtime.controller.signal } : {}),
+    // 大文件可能传超过 STS 有效期（默认 15 分钟），到期前由 SDK 回调换新凭证
+    refreshCredential: () =>
+      fetchOssCredential({
+        fileHash,
+        fileName: task.fileName,
+        fileSize: task.fileSize,
+        totalChunks: task.totalChunks,
+        categoryId: task.categoryId,
+        taskId: task.taskId
+      }),
+    onProgress: ({ loaded, total }) => {
+      // 直传进度按字节算，比分片比例更准（最后一片通常不满）
+      runtime.sessionLoaded = loaded
+      task.progress = total ? Math.min(Math.floor((loaded / total) * 100), 100) : 0
+      tickSpeed(task)
+    },
+    onCheckpoint: (checkpoint: StoredCheckpoint) => {
+      // 每完成一片回调一次；只有断点内容真的变了才写 localStorage（避免每片都全量序列化）
+      const unchanged =
+        !!lastSavedCheckpoint &&
+        lastSavedCheckpoint.uploadId === checkpoint.uploadId &&
+        lastSavedCheckpoint.doneParts.length === checkpoint.doneParts.length
+      if (unchanged) return
+      // 只含 uploadId / etag / partSize 等不敏感字段，可以落本地
+      lastSavedCheckpoint = checkpoint
+      saveRecord(task, fileHash, checkpoint)
+    }
+  })
+
+  if (!runtime.running) throw new OssUploadCanceled()
+
+  // 直传完成：进度 100%，元数据已由 uploadFileToOss 内部调 /oss/complete 登记
+  task.progress = 100
+  task.uploadedChunks = getChunkIndexes(task.totalChunks)
+  runtime.fileHash = fileHash
+  runtime.timings.upload = Date.now() - runtime.sessionStart
+  return true
+}
+
+
 
 /**
  * 开始 / 继续一个任务（计算哈希 -> 校验 -> 上传剩余分片）
@@ -477,7 +636,9 @@ async function startTask(task: UploadTask) {
     updateProgress(task)
     saveRecord(task, fileHash)
 
-    // 3. 并发上传剩余分片
+    // 3. 上传文件字节
+    //    优先 OSS 直传（字节不经过服务器，速度只受用户带宽限制）；
+    //    未配置 OSS / 签发凭证失败时回退到原来的分片上传，保证功能不退化。
     task.status = 'uploading'
     runtime.sessionLoaded = runtime.doneChunks.size * task.chunkSize
     runtime.sessionStart = Date.now()
@@ -486,10 +647,14 @@ async function startTask(task: UploadTask) {
       if (task.status === 'uploading') tickSpeed(task)
     }, 500)
 
-    await uploadPendingChunks(task, fileHash)
+    const uploadedViaOss = await tryUploadViaOss(task, fileHash, records);
+    if (!uploadedViaOss) {
+      await uploadPendingChunks(task, fileHash)
+    }
 
     if (runtime.timer) window.clearInterval(runtime.timer)
     if (!runtime.running) return
+
 
     // 4. 完成
     task.status = 'done'
@@ -515,6 +680,7 @@ async function startTask(task: UploadTask) {
       window.clearInterval(runtime.timer)
       runtime.timer = undefined
     }
+
     runtime.running = false
   }
 }
@@ -555,6 +721,7 @@ async function uploadChunkWithRetry(formData: FormData, signal?: AbortSignal) {
  */
 async function uploadPendingChunks(task: UploadTask, fileHash: string) {
   const runtime = getRuntime(task.uid)
+  task.channel = 'local'
   const pending = getChunkIndexes(task.totalChunks).filter(
     (index) => !runtime.doneChunks.has(index)
   )

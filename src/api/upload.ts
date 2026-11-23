@@ -3,6 +3,7 @@ import { getAccessToken } from './tokenStore'
 import type {
   CheckFileParams,
   CheckFileResult,
+  OssCredential,
   UploadChunkResult,
   UploadFileItem,
   UploadFileQuery
@@ -26,6 +27,27 @@ export function uploadChunk(data: FormData, signal?: AbortSignal) {
 // 手动合并分片（服务端不支持自动合并时可使用）
 export function mergeChunks(data: CheckFileParams) {
   return request.post<UploadFileItem>('/upload/merge', data)
+}
+
+// ============ OSS 直传 ============
+
+/**
+ * 获取浏览器直传凭证（STS 临时凭证）
+ *
+ * 后端会算好 object key（按「用户 + 文件 hash + 文件名」），前端拿到凭证后
+ * 直接连 OSS 传字节，不再经过我们的服务器 —— 这是解决「部署后上传太慢」的关键。
+ * 未配置 OSS 时接口返回 503（code=OSS_NOT_CONFIGURED），调用方据此回退到分片上传。
+ */
+export function getOssCredential(data: CheckFileParams) {
+  return request.post<OssCredential>('/upload/oss/credential', data)
+}
+
+/**
+ * 直传完成后通知后端登记文件元数据。
+ * 后端会用 HeadObject 实测大小，不信任前端上报值，所以这里不用传 fileSize。
+ */
+export function completeOssUpload(data: CheckFileParams) {
+  return request.post<UploadFileItem>('/upload/oss/complete', data)
 }
 
 // 获取已上传文件列表

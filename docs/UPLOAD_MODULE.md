@@ -416,7 +416,138 @@ cd backend && npm test
 | Firefox 下载占内存 | 无 File System Access API，需拼 Blob | Service Worker 代理下载 / 分片下载 |
 | 断点需重新选文件 | 浏览器安全限制无法持久化 File | Chrome 可用 `showOpenFilePicker` 存 `FileSystemFileHandle` 到 IndexedDB |
 | 元数据存 JSON 文件 | 并发写有竞态风险 | 换 SQLite / 数据库 |
-| 无跨域分片直传 | 所有分片走应用服务器 | 换对象存储 + 预签名 URL 直传 |
+| ~~无跨域分片直传~~ | 已解决：见第 9 节 OSS 直传 | — |
 | 合并全量串行读 | GB 级合并耗时较长 | 预分配 + 并行写不同区间（`fs.write` 带 position） |
 
 Worker 里跑，主线程全程可交互，只通过 `postMessage` 回传进度（每 4MB 一次）。
+
+---
+
+## 9. 对象存储直传（阿里云 OSS）
+
+### 9.1 为什么要改
+
+部署到云服务器后上传极慢。根因不是分片算法，而是**拓扑**：
+
+```
+旧方案：浏览器 ──所有分片──▶ 我们的服务器（落盘）──合并──▶ 本地磁盘
+                            ↑ 云主机公网带宽常只有 1~10Mbps
+```
+
+1GB 文件在 5Mbps 下光传输就要 ~27 分钟，而且服务器还要同时承担
+multipart 解析（CPU）、临时落盘 + 合并读写（双倍磁盘 IO）。分片并发
+再高，也只是把一条窄管道切得更细。
+
+```
+新方案：浏览器 ──STS 凭证──▶ 我们的服务器（只发凭证，几百字节）
+       浏览器 ──文件字节──▶ OSS（就近接入、原生并发、无限扩容）
+       浏览器 ──完成通知──▶ 我们的服务器（HeadObject 校验 + 登记元数据）
+```
+
+服务器不再经手字节，速度只取决于用户自己的带宽。
+
+### 9.2 凭证设计（安全关键）
+
+| 角色 | 拿到什么 | 有效期 | 能力边界 |
+|---|---|---|---|
+| 服务器 | 长期 AccessKey（环境变量 / secret 文件） | 长期 | 签发 STS、Head/Delete 对象、签下载 URL |
+| 浏览器 | STS 临时凭证 | 默认 15 分钟 | **只能写一个 object key**（`acs:oss:*:*:{bucket}/{key}`），只能用 `PutObject` / `Abort` / `ListParts`，且有 `oss:ContentLength` 上限 |
+
+关键点：**object key 由服务端算**（`{prefix}/{ownerId}/{fileHash}/{文件名}`），前端不能改。
+所以即使凭证泄露，也只能传那一个文件，且 15 分钟后自动失效；配合 RAM 角色的
+`uploads/${userId}/*` 前缀策略，可以做到「每个用户只能写自己的目录」。
+
+### 9.3 接口清单
+
+| 方法 | 路径 | 作用 | 说明 |
+|---|---|---|---|
+| POST | `/api/upload/check` | 秒传 / 续传判定 | 命中判定改为按 `storage` 字段走 OSS Head 或本地磁盘 |
+| POST | `/api/upload/oss/credential` | 签发直传凭证 | 同时返回服务端算好的 `key` 与建议 `chunkSize`；未配置 OSS 返回 503 + `OSS_NOT_CONFIGURED` |
+| POST | `/api/upload/oss/complete` | 上传完成登记 | **以 HeadObject 实测大小为准**，前端上报的 `fileSize` 不采信 |
+| GET | `/api/upload/files/:id/download` | 下载 / 预览 | OSS 文件在鉴权后 302 到 OSS 签名 URL（2~10 分钟有效） |
+| DELETE | `/api/upload/files/:id` | 删除 | 无其它记录引用时同时删 OSS 对象 |
+| POST | `/api/upload/cleanup` | 运维清理 | 顺带清理 OSS 上「初始化未完成」的分片上传事件 |
+
+### 9.4 前端双通道
+
+`uploadManager.startTask()` 的第三步由 `tryUploadViaOss()` 接管：
+
+- 拿凭证成功 → 用 `ali-oss` 的 `multipartUpload()` 直传（内部分片并发、失败自动重试、ETag 收集、Complete 排序）；
+- 凭证接口返回 503 `OSS_NOT_CONFIGURED` → 自动回退原有的分片上传（功能不退化）；
+- 其它错误（401 / 500）→ 直接报错，**不静默回退**（否则永远发现不了直传挂了）。
+
+通道策略可切换：`setUploadChannel('auto' | 'oss' | 'local')`，默认 `auto`。
+
+**并发数**：直传和本地分片**共用页面右上角同一个「N 并发」设置**（`maxConcurrency`，1~6）。
+`tryUploadViaOss()` 把它作为 `parallel` 传给 SDK，再由 `clampOssParallel()` 收敛：
+非法值回落默认 3，超过 6 收敛到 6（浏览器对同一域名的并发连接数限制）。
+
+> 早期版本这里写死 `parallel: 4`，导致页面上的并发下拉框对直传无效 ——
+> 用户调到 1 观察稳定现象却看不出区别。已修正，`ossUpload.test.ts` 覆盖了边界。
+
+### 9.5 断点续传为什么能跨刷新
+
+分片上传的断点靠「服务端已有分片列表」恢复；直传的字节直接进了 OSS，服务器看不到
+part 列表，所以改为持久化 SDK 的 checkpoint：
+
+```ts
+// 只存能序列化的部分（SDK 的 checkpoint 里带 File 对象，JSON 化会丢）
+{ name, fileSize, partSize, uploadId, doneParts: [{ number, etag }] }
+```
+
+续传时用 `toSdkCheckpoint(stored, file)` 把当前 File 重新挂回去，SDK 会自动跳过
+`doneParts` 里的分片。注意：`file` 对象无法跨刷新保留，所以仍需用户重新选择原文件
+（浏览器安全限制，无解）。
+
+### 9.6 配置步骤
+
+1. 创建 Bucket，读写权限选「私有」（下载走签名 URL）；
+2. 建 RAM 角色，可信实体为当前账号，授权只写本 bucket 的 `uploads/*`；
+3. 给调用 STS 的 RAM 用户授权 `sts:AssumeRole`（只到上面那个角色 ARN）；
+4. 在 Bucket 上配置生命周期规则「清理未完成的分片」（如 7 天）——双保险；
+5. 填入 `backend/.env`（详见 `.env.example` 的 OSS 段落）：
+
+```bash
+OSS_BUCKET=geek-task-hub
+OSS_REGION=oss-cn-hangzhou
+OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+OSS_ACCESS_KEY_ID=LTAI****
+OSS_ACCESS_KEY_SECRET=****
+OSS_STS_ROLE_ARN=acs:ram::1234567890:role/gth-upload
+```
+
+**不配这五项也能跑**：`isOssEnabled()` 返回 false，前端自动走本地分片上传。
+
+### 9.6.1 配完自检
+
+失败点分散在「环境变量 → 密钥权限 → 桶策略 → RAM 角色 → STS → CORS」六层，
+任何一层没配对，前端表现都只是「上传失败」或「悄悄回退本地」。用自检脚本逐层验证：
+
+```bash
+cd backend
+npm run check:oss
+```
+
+它会按依赖顺序检查，**第一个 ❌ 就是该修的地方**，并把 OSS 的错误码翻译成
+「原因 + 去哪个控制台改」。CORS 无法自动检测，脚本会打印需要人工核对的配置项。
+
+只读不改：仅放一个 0 字节探针对象，验完即删。
+
+### 9.7 兼容性处理
+
+| 场景 | 处理 |
+|---|---|
+| 升级前上传的老文件 | `FileMeta.storage` 缺省视为 `local`，下载 / 删除仍走磁盘逻辑 |
+| 同一文件挂到多个任务 | 秒传补记录时必须**继承** `storage` 与 `objectKey`，否则新记录会指向不存在的本地文件 |
+| 列表页存在性校验 | OSS 文件不能查本地磁盘（会被全部误过滤），也不能逐个 Head（N 次网络往返）→ 交给下载接口在访问时校验 |
+| 同文件多任务并发 | 删除时先判断是否还有其它记录引用 `fileHash` / `objectKey`，有则不动物理文件 |
+| 大文件传超过 15 分钟 | SDK 的 `refreshSTSToken` 回调重新签发凭证（`refreshSTSTokenInterval` = 5 分钟检查） |
+
+### 9.8 已验证
+
+- 后端 `tsc --noEmit` 干净；`node:test` **204/204 通过**（新增 `oss.test.ts` 9 个用例：
+  key 分层 / 路径穿越防护 / 分片大小不超 10000 片 / 缺配置时降级）；
+- 前端 `vue-tsc --noEmit` 干净；Vitest **184/184 通过**（12 个文件）。原有分片上传用例通过 mock
+  「后端未配 OSS」继续覆盖回退路径；新增 `ossUpload.test.ts` 9 例，覆盖并发收敛与
+  checkpoint 序列化（含「File 对象不能进 localStorage」这一坑）。
+

@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="ai-chat-panel">
     <!-- ========== 左侧：历史会话 ========== -->
     <aside class="conv-sidebar" :class="{ collapsed: sidebarCollapsed }">

@@ -215,6 +215,8 @@ export interface UploadTask {
    * 与 file.size === 0 等价，但语义明确，不依赖文件大小推断状态。
    */
   needsFile?: boolean
+  /** 上传通道：OSS 直传 / 本地分片（由引擎实际选择后写入，页面可展示） */
+  channel?: 'oss' | 'local'
 }
 
 // 文件记录的本地持久化结构（用于刷新后找回断点）
@@ -232,8 +234,24 @@ export interface UploadRecord {
   taskIds?: number[]
   /** 所属任务 id（单选时代 / 老记录字段） */
   taskId?: number
+  /**
+   * OSS 直传的断点信息（SDK 的 checkpoint）
+   *
+   * 为什么需要单独存：分片上传的断点靠「服务端已有分片列表」恢复，
+   * 而直传的字节直接落在 OSS，我们服务器看不到 part 列表，
+   * 只能把 SDK 返回的 checkpoint（含 uploadId + 已完成分片的 ETag）存下来，
+   * 下次带着它调用 multipartUpload 就能跳过已传分片。
+   */
+  ossCheckpoint?: {
+    name: string
+    fileSize: number
+    partSize: number
+    uploadId: string
+    doneParts: Array<{ number: number; etag: string }>
+  }
   updatedAt: number
 }
+
 
 // 秒传/续传校验请求参数
 // categoryId / taskId 为必填：每份文件都必须归到某个分类与某个任务下
@@ -266,6 +284,31 @@ export interface UploadChunkResult {
   index: number
   // 合并成功后的文件地址（仅最后一片合并时返回）
   url?: string
+}
+
+/**
+ * OSS 直传凭证（后端 POST /upload/oss/credential 返回）
+ *
+ * 注意 key 由服务端算好，前端不能改：凭证（STS 临时密钥 + 策略）只对这一个
+ * object key 有效，改 key 会直接被 OSS 拒绝（403）。
+ */
+export interface OssCredential {
+  mode: 'sts'
+  bucket: string
+  /** bucket 访问域名（不带协议） */
+  endpoint: string
+  region: string
+  /** 服务端算好的 object key，上传时原样使用 */
+  key: string
+  accessKeyId: string
+  accessKeySecret: string
+  securityToken: string
+  /** 凭证过期时间（ISO 字符串） */
+  expiration: string
+  /** 服务端建议的分片大小（字节）：保证分片数不超过 OSS 的 10000 上限 */
+  chunkSize: number
+  /** 是否走分片直传（大文件）；false 表示 PutObject 一次传完 */
+  multipart: boolean
 }
 
 // 文件实体（服务端返回的已上传文件）

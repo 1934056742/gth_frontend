@@ -1,4 +1,4 @@
-﻿// @vitest-environment jsdom
+// @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
@@ -21,11 +21,26 @@ const checkFileMock = vi.fn()
 const uploadChunkMock = vi.fn()
 const getFilesMock = vi.fn()
 const calculateFileHashMock = vi.fn()
+// OSS 直传：默认按「服务端没配 OSS」处理，让原有分片上传的用例保持原语义；
+// 需要验证直传链路的用例再单独把这几个 mock 改成成功返回。
+const getOssCredentialMock = vi.fn()
+const completeOssUploadMock = vi.fn()
+
+/** 构造一个「后端未配置 OSS」的错误（与真实响应结构一致，引擎据此回退本地分片） */
+function ossNotConfiguredError() {
+  const error = new Error('OSS 未配置，请使用分片上传') as Error & {
+    response?: { status: number; data: { code: string } }
+  }
+  error.response = { status: 503, data: { code: 'OSS_NOT_CONFIGURED' } }
+  return error
+}
 
 vi.mock('@/api/upload', () => ({
   checkFile: (...args: unknown[]) => checkFileMock(...args),
   uploadChunk: (...args: unknown[]) => uploadChunkMock(...args),
-  getFiles: (...args: unknown[]) => getFilesMock(...args)
+  getFiles: (...args: unknown[]) => getFilesMock(...args),
+  getOssCredential: (...args: unknown[]) => getOssCredentialMock(...args),
+  completeOssUpload: (...args: unknown[]) => completeOssUploadMock(...args)
 }))
 
 vi.mock('@/utils/hash', async () => {
@@ -98,6 +113,9 @@ beforeEach(() => {
   checkFileMock.mockResolvedValue({ exists: false, uploadedChunks: [] })
   uploadChunkMock.mockResolvedValue({ index: 0 })
   getFilesMock.mockResolvedValue([])
+  // 默认没有 OSS：引擎应自动回退到分片上传（原有用例全部依赖这个前提）
+  getOssCredentialMock.mockRejectedValue(ossNotConfiguredError())
+  completeOssUploadMock.mockResolvedValue({ id: 1 })
   // 屏蔽 uploadManager 的耗时日志，保持测试输出干净
   vi.spyOn(console, 'info').mockImplementation(() => {})
 })

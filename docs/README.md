@@ -151,7 +151,7 @@ Test Files  6 passed (6)
 
 | 文档 | 内容 | 适合谁 |
 |---|---|---|
-| [UPLOAD_MODULE.md](./docs/UPLOAD_MODULE.md) | 架构、设计决策、时序图、接口清单 | 想快速了解全貌 |
+| [UPLOAD_MODULE.md](./docs/UPLOAD_MODULE.md) | 架构、设计决策、时序图、接口清单；第 9 节：阿里云 OSS 直传（STS 凭证、双通道、兼容性） | 想快速了解全貌 |
 | [MODULE_GUIDE.md](./docs/MODULE_GUIDE.md) | 逐文件逐函数精读，含 bug 排查过程 | 想彻底吃透代码 |
 | [INTERVIEW_QA.md](./docs/INTERVIEW_QA.md) | 30 个追问 + 标准答法 + 白板题 | 准备面试（上传模块） |
 | [AI_MODULE_GUIDE.md](./docs/AI_MODULE_GUIDE.md) | AI 对话 + RAG 知识库精读：链路、BM25、SSE、防幻觉、12 个追问 | 想讲清楚 AI 模块 |

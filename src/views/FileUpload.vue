@@ -124,6 +124,10 @@
               <el-icon class="file-icon"><Document /></el-icon>
               <span class="file-name" :title="task.fileName">{{ task.fileName }}</span>
               <el-tag v-if="task.instant" type="success" effect="dark" size="small">秒传</el-tag>
+              <!-- 直传标记：让用户一眼看出字节是走 OSS 还是经过我们的服务器 -->
+              <el-tag v-if="task.channel === 'oss'" type="warning" effect="plain" size="small">
+                对象存储直传
+              </el-tag>
               <el-tag :type="statusTagType(task.status)" effect="plain" size="small">
                 {{ statusLabel(task.status) }}
               </el-tag>
@@ -154,7 +158,12 @@
 
             <div class="task-meta">
               <span>{{ formatSize(task.fileSize) }}</span>
-              <span>分片 {{ task.uploadedChunks.length }} / {{ task.totalChunks }}</span>
+              <!-- 直传没有「第几片」的概念（SDK 内部并发），改用已传字节 / 总字节，信息更准确 -->
+              <span v-if="task.channel === 'oss'">
+                {{ formatSize(Math.round((task.fileSize * task.progress) / 100)) }} /
+                {{ formatSize(task.fileSize) }}
+              </span>
+              <span v-else>分片 {{ task.uploadedChunks.length }} / {{ task.totalChunks }}</span>
               <span v-if="task.status === 'uploading'" class="speed">
                 {{ formatSpeed(task.speed) }} · 剩余 {{ formatRemaining(task.remaining) }}
               </span>
