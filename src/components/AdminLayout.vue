@@ -36,7 +36,7 @@
                 <el-dropdown-item command="profile">
                   {{ userStore.user?.account || '用户' }}
                 </el-dropdown-item>
-                <el-dropdown-item command="password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="password" v-if='userStore.user.role=="member"'>修改密码</el-dropdown-item>
                 <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>

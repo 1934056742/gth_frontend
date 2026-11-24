@@ -24,10 +24,14 @@
             <el-table-column prop="email" label="邮箱"> </el-table-column>
             <el-table-column prop="id" label="操作" width="280px"> 
                 <template #default="scope">
-                  <el-button v-if="scope.row.role=='member'" @click="resetPassWord(scope.row)">重置密码</el-button>
-                   <el-button @click="openDialog('edit',scope.row)">修改</el-button>
-                   <el-button @click="deleteUser(scope.row)">删除</el-button>
-                </template>
+                  <!-- 确保 scope.row 存在再渲染 -->
+                    <template v-if="scope.row && scope.row.role === 'member'">
+                      <el-button @click="resetPassWord(scope.row)">重置密码</el-button>
+                      <el-button  @click="openDialog('edit',scope.row)">修改</el-button>
+                      <el-button  @click="deleteUser(scope.row)">删除</el-button>
+                    </template>
+                    <span v-else>-</span>
+                  </template>
             </el-table-column>
           </el-table>
     </el-main>
